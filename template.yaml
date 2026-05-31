@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lightweight SIEM on AWS. Routes HIGH/CRITICAL AWS Security Hub findings to a
+  Slack/Teams webhook in real time, and archives every finding to S3 for later
+  search with Athena. No third-party SIEM, no license.
+  Companion to the Least Privilege blog, article 3.
+
+Parameters:
+  WebhookSecretArn:
+    Type: String
+    Description: >
+      ARN of a Secrets Manager secret whose value is the Slack/Teams incoming
+      webhook URL. Create it before deploying (see README). The URL is never
+      stored in this template or in source control.
+    AllowedPattern: "^arn:aws:secretsmanager:.+$"
+    ConstraintDescription: Must be a Secrets Manager secret ARN.
+  Project:
+    Type: String
+    Default: lightweight-siem
+  Environment:
+    Type: String
+    Default: security
+  Owner:
+    Type: String
+    Default: security-team
+  Team:
+    Type: String
+    Default: security
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 15
+    MemorySize: 128
+    Tracing: Active
+
+Resources:
+
+  # ── Searchable history. The half that earns the word "SIEM". ──────────────
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-and-expire
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            NoncurrentVersionExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: Team
+          Value: !Ref Team
+
+  # ── TLS-only. An archive an attacker can read in transit is not an archive. ─
+  ArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArchiveBucket.Arn
+              - !Sub "${ArchiveBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ── The processor. Reads a finding, alerts, archives. ────────────────────
+  SiemAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${Project}-finding-router"
+      Description: Routes HIGH/CRITICAL Security Hub findings to Slack and archives them to S3.
+      CodeUri: lambda/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+      # Least privilege: write only under findings/ in our own bucket, and read
+      # only the one webhook secret. SAM adds CloudWatch Logs and X-Ray on top.
+      Policies:
+        - Statement:
+            - Sid: WriteFindingsToArchive
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${ArchiveBucket.Arn}/findings/*"
+            - Sid: ReadWebhookSecret
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref WebhookSecretArn
+      # SAM creates the EventBridge rule and the invoke permission from this.
+      Events:
+        SecurityHubFinding:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.securityhub
+              detail-type:
+                - "Security Hub Findings - Imported"
+              detail:
+                findings:
+                  Severity:
+                    Label:
+                      - HIGH
+                      - CRITICAL
+                  Workflow:
+                    Status:
+                      - NEW
+                  RecordState:
+                    - ACTIVE
+      Tags:
+        Project: !Ref Project
+        Environment: !Ref Environment
+        Owner: !Ref Owner
+        Team: !Ref Team
+
+Outputs:
+  ArchiveBucketName:
+    Description: S3 bucket holding archived ASFF findings (query with Athena).
+    Value: !Ref ArchiveBucket
+  FunctionName:
+    Description: Lambda that routes and archives findings.
+    Value: !Ref SiemAlertFunction
+  FunctionRoleArn:
+    Description: Least-privilege execution role for the function.
+    Value: !GetAtt SiemAlertFunctionRole.Arn
