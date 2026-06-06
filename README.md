@@ -19,6 +19,9 @@ GuardDuty / Inspector / Config / Access Analyzer
                         └─► S3 archive ─► Athena   (searchable history)
 ```
 
+> Full architecture diagram (draw.io): [`docs/lightweight-siem-architecture.drawio`](docs/lightweight-siem-architecture.drawio)
+> Open it in [app.diagrams.net](https://app.diagrams.net) or draw.io desktop.
+
 ## What is here
 
 | File | Purpose |
